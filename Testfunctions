@@ -1,14 +1,153 @@
-const mongoose = require("mongoose");
+const express = require('express');
+const mongoose = require('mongoose');
+const crypto = require('crypto');
+const { generateReport } = require('./report');
 
-const configDb = () => {
-  mongoose
-    .connect('mongodb://localhost:27017/')
-    .then((c) => {
-      console.log(`Mongodb connect to: ${c.connection.host}`);
-    })
-    .catch((e) => {
-      console.log(e);
+// Connect to the database
+mongoose.connect('mongodb://localhost/restaurant_data', { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log('Connected to the database'))
+  .catch((error) => console.error(error));
+
+// Create the Express app
+const app = express();
+
+// Parse JSON request bodies
+app.use(express.json());
+
+// Define the /trigger_report endpoint
+app.post('/trigger_report', async (req, res) => {
+  try {
+    // Generate a random report ID
+    const reportId = crypto.randomBytes(16).toString('hex');
+    
+    // Trigger report generation (using a function you have defined earlier)
+    await generateReport(reportId);
+    
+    // Send the report ID in the response
+    res.json({ reportId });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Start the server
+const port = 3000;
+app.listen(port, () => console.log(`Server listening on port ${port}`));
+
+///////////////////////////////////////////////////////////////////////////////////////////////
+
+const generateReport = async () => {
+    const currentTime = new Date();
+    const maxTimestamp = await getMaxTimestamp(); // a function that retrieves the max timestamp from the first data source
+  
+    // Check if data is up-to-date
+    if (currentTime.getTime() - maxTimestamp.getTime() > ONE_HOUR_IN_MS) {
+      throw new Error('Data is not up-to-date.');
+    }
+  
+    const stores = await Store.find(); // Retrieve all stores from the database
+  
+    const reportRows = [];
+  
+    // Iterate over each store and generate a row for the report
+    for (const store of stores) {
+      const timezone = store.timezone_str || 'America/Chicago';
+      const businessHours = store.business_hours || getDefaultBusinessHours();
+  
+      // Retrieve the status of the store for the last hour and day
+      const [statusLastHour, downtimeLastHour] = await getStatusAndDowntimeForInterval(store.store_id, maxTimestamp, ONE_HOUR_IN_MS, timezone, businessHours);
+      const [statusLastDay, downtimeLastDay] = await getStatusAndDowntimeForInterval(store.store_id, maxTimestamp, ONE_DAY_IN_MS, timezone, businessHours);
+  
+      // Extrapolate the uptime based on the status and downtime
+      const uptimeLastHour = ONE_HOUR_IN_MS - downtimeLastHour;
+      const uptimeLastDay = ONE_DAY_IN_MS - downtimeLastDay;
+  
+      // Retrieve the status of the store for the last week
+      const [statusLastWeek, downtimeLastWeek] = await getStatusAndDowntimeForInterval(store.store_id, maxTimestamp, ONE_WEEK_IN_MS, timezone, businessHours);
+  
+      reportRows.push({
+        store_id: store.store_id,
+        uptime_last_hour: uptimeLastHour / (1000 * 60), // Convert to minutes
+        uptime_last_day: uptimeLastDay / (1000 * 60 * 60), // Convert to hours
+        update_last_week: (currentTime.getTime() - maxTimestamp.getTime()) / (1000 * 60 * 60), // Convert to hours
+        downtime_last_hour: downtimeLastHour / (1000 * 60), // Convert to minutes
+        downtime_last_day: downtimeLastDay / (1000 * 60 * 60), // Convert to hours
+        downtime_last_week: downtimeLastWeek / (1000 * 60 * 60), // Convert to hours
+      });
+    }
+  
+    // Write the report to a CSV file
+    const csvString = await parse(reportRows, { header: true });
+    const reportId = uuidv4();
+    const reportFilePath = `./reports/${reportId}.csv`;
+    await fs.writeFile(reportFilePath, csvString);
+  
+    // Save the report ID to the database
+    await Report.create({ report_id: reportId, status: 'Complete', file_path: reportFilePath });
+  
+    return reportId;
+  };
+
+
+  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+write code for endpoint /get_report endpoint 
+
+app.get('/get_report/:report_id', async (req, res) => {
+  const { report_id } = req.params;
+  try {
+    // Check if report is complete
+    const report = await Report.findOne({ report_id });
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+    if (!report.completed) {
+      return res.status(200).json({ status: 'Running' });
+    }
+
+    // Generate CSV file
+    const filename = `report_${report_id}.csv`;
+    const filePath = path.join(__dirname, 'reports', filename);
+    const csvStream = fastCsv.format({ headers: true });
+    const writeStream = fs.createWriteStream(filePath);
+    csvStream.pipe(writeStream);
+    csvStream.write([
+      'store_id',
+      'uptime_last_hour',
+      'uptime_last_day',
+      'update_last_week',
+      'downtime_last_hour',
+      'downtime_last_day',
+      'downtime_last_week',
+    ]);
+    report.data.forEach((row) => {
+      csvStream.write([
+        row.store_id,
+        row.uptime_last_hour,
+        row.uptime_last_day,
+        row.update_last_week,
+        row.downtime_last_hour,
+        row.downtime_last_day,
+        row.downtime_last_week,
+      ]);
     });
-};
+    csvStream.end();
 
-module.exports = configDb;
+    // Send CSV file as response
+    res.setHeader('Content-disposition', `attachment; filename=${filename}`);
+    res.setHeader('Content-Type', 'text/csv');
+    const filestream = fs.createReadStream(filePath);
+    filestream.pipe(res);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+This endpoint takes in a report_id parameter as part of the URL path and returns the status of the report or the CSV file, depending on whether the report has been completed or not.
+
+First, it checks if the report with the specified report_id exists in the database. If it doesn't, it returns a 404 error. If the report exists but hasn't been completed yet, it returns a status of "Running". If the report has been completed, it generates the CSV file and sends it as a response.
+
+The CSV file is generated using the fast-csv library, which allows us to create a writable stream for the file and write data to it row by row. Once the CSV file has been generated, it is sent as a response to the client with the appropriate headers.
+
+If there is an error while generating the report or sending the response, the endpoint returns a 500 error with an appropriate error message.
