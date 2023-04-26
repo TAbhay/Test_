@@ -1,0 +1,6 @@
+node_modules
+package-lock.json
+.env
+bq-results.csv
+Menuhours.csv
+storestatus.csv
